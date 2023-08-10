@@ -1,0 +1,52 @@
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: eckbbqpi
+spec:
+  monitoring:
+    logs:
+      elasticsearchRefs:
+      - name: eckbbqpi
+    metrics:
+      elasticsearchRefs:
+      - name: eckbbqpi
+  nodeSets:
+  - config:
+      xpack.security.audit.enabled: false
+      xpack.security.audit.logfile.events.emit_request_body: true
+    count: 3
+    name: main
+    podTemplate:
+      spec:
+        containers:
+        - env:
+          - name: ES_JAVA_OPTS
+            value: -Xms8g -Xmx8g
+          name: elasticsearch
+          resources:
+            limits:
+              cpu: 6
+              memory: 16Gi
+            requests:
+              cpu: 2
+              memory: 8Gi
+        initContainers:
+        - command:
+          - sh
+          - -c
+          - sysctl -w vm.max_map_count=262144
+          name: sysctl
+          securityContext:
+            privileged: true
+            runAsUser: 0
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 50Gi
+        storageClassName: standard
+  version: 8.9.0
