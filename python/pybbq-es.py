@@ -1,172 +1,214 @@
-from bluepy.btle import *
-import requests
+import asyncio
 import json
-from datetime import datetime
+import os
+import struct
+import sys
+import time
+from datetime import datetime, timezone
 
-debug = False # Prints messages to stdout. Once things are working set this to False
-temperature_units = "f" # Change to "f" or "c" if that's what you prefer.
+import requests
+from bleak import BleakClient, BleakScanner
 
-# iBBQ static commands
-CREDENTIALS_MESSAGE  = bytearray.fromhex("21 07 06 05 04 03 02 01 b8 22 00 00 00 00 00")
-REALTIME_DATA_ENABLE = bytearray.fromhex("0B 01 00 00 00 00")
-UNITS_FAHRENHEIT     = bytearray.fromhex("02 01 00 00 00 00")
-UNITS_CELSIUS        = bytearray.fromhex("02 00 00 00 00 00")
-BATTERY_LEVEL        = bytearray.fromhex("08 24 00 00 00 00")
-# iBBQ static service
-MAIN_SERVICE         = 0xFFF0 # Service which provides the characteristics 
-CCCD_UUID            = 0x2902 # We have to write here to enable notifications. bluepy doesn't do this for us. See the "show_all_descriptors" XXX Fix me
-# iBBQ static characteristics
-SETTINGS_RESULTS     = 0xFFF1
-PAIR_UUID            = 0xFFF2
-HISTORY_UUID         = 0xFFF3 # Don't know how this works, here for completeness
-REALTIMEDATA_UUID    = 0xFFF4
-CMD_UUID             = 0xFFF5
-# Static hex little endian ones and zeros
-ON                   = bytearray.fromhex("01 00")
-OFF                  = bytearray.fromhex("00 00")
+CREDENTIALS_MESSAGE = bytearray.fromhex("2107060504030201b8220000000000")
+REALTIME_DATA_ENABLE = bytearray.fromhex("0B0100000000")
+UNITS_FAHRENHEIT = bytearray.fromhex("020100000000")
+UNITS_CELSIUS = bytearray.fromhex("020000000000")
+BATTERY_LEVEL = bytearray.fromhex("082400000000")
 
-def logger(message):
-    if debug: print(message)
+IBBQ_SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb"
+SETTINGS_RESULTS_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"
+PAIR_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"
+REALTIMEDATA_UUID = "0000fff4-0000-1000-8000-00805f9b34fb"
+CMD_UUID = "0000fff5-0000-1000-8000-00805f9b34fb"
 
-class ScanDelegate(DefaultDelegate):
-    def __init__(self):
-        DefaultDelegate.__init__(self)
-    def handleDiscovery(self, dev, isNewDev, isNewData):
-        if isNewDev:
-            logger("Discovered device %s" % (dev.addr))
-
-class DataDelegate(DefaultDelegate):
-    def __init__(self):
-        DefaultDelegate.__init__(self)
-    def handleNotification(self, cHandle, data):
-        # Elastic POST REST info
-        auth=("elastic", "<password>")
-        headers={"Content-Type": "application/json"}
-        target="https://<cluster>:9200/<indexname>/_doc"
-        if cHandle == 48:
-            # this is temperature data!  48 is the handle of the probes characteristic XXX check terminology
-            temps = [int.from_bytes(data[i:i+2], "little") for i in range(0,len(data),2)]
-            # Note: "0xFF" or 65526 means the probe is not connected and so should be ignored.
-            logger(temps)
-            for idx, item in enumerate(temps):
-                if item != 65526: # This is what gets reported when the probe isn't plugged in.
-                    item = item / 10
-                    if temperature_units == "f":
-                        item = item * 1.8 + 32
-                    if temperature_units == "k":
-                        # Science
-                        item = item + 273
-                    data={"bbq_temp":int(item), "bbq_probe":int(idx+1), "date": int(datetime.timestamp(datetime.now()))}
-                    tempsend=json.dumps(data)
-                    #print(data)
-                    rr = requests.post(target, auth=auth, headers=headers, data=tempsend)
-                    if rr.status_code != 201:
-                        print("Error: ", rr.content)
-
-        elif cHandle == 37:
-            header, current_voltage, max_voltage,pad = struct.unpack("<BHHB", data)
-            if max_voltage == 0: max_voltage = 6580 # XXX check this
-            batt_percent = 100 * current_voltage / max_voltage
-            #print("bbq.battery:",float(batt_percent))
-            batt = {"bbq_battery": float(batt_percent)}
-            battsend = json.dumps(batt)
-            bb = requests.post(target, auth=auth, headers=headers, data=battsend)
-            if bb.status_code != 201:
-                print("Error: ", bb.content)
-            logger(batt_percent)
-
-        else:
-            logger("Unknown data received from handle %s: %s" % (cHandle, data))
-
-def find_bbq_hwaddr():
-    bbqs = {}
-    scanner = Scanner().withDelegate(ScanDelegate())
-    
-    attempt_count = 0
-    max_attempts = 10
-
-    while attempt_count < max_attempts:
-        try:
-            devices = scanner.scan(10.0)
-            for dev in devices:
-                logger("Device %s, RSSI=%sdB" % (dev.addr, dev.rssi))
-                for (adtype, desc, value) in dev.getScanData():
-                    if desc == "Complete Local Name" and value == "iBBQ":
-                        bbqs[dev.rssi] = dev
-                        logger("Found iBBQ device %s at address %s. RSSI %s" % (value, dev.addr, dev.rssi))
-
-            # We should now have a dict of bbq devices, let's sort by rssi and choose the one with the best connection
-            if len(bbqs) > 0:
-                bbq = bbqs[sorted(bbqs.keys(), reverse=True)[0]].addr
-                logger("Using hwaddr %s" % bbq)
-                return bbq
-            else:
-                return None
-        except BTLEDisconnectError:
-            attempt_count += 1
-            logger("Device disconnected, retrying... (Attempt %s of %s)" % (attempt_count, max_attempts))
-            time.sleep(1)
-
-    logger("Failed to connect after %s attempts, exiting..." % max_attempts)
-    return None
+ES_URL = os.environ.get("ES_URL", "https://localhost:9200")
+ES_USER = os.environ.get("ES_USER", "elastic")
+ES_PASSWORD = os.environ.get("ES_PASSWORD", "")
+ES_INDEX = os.environ.get("ES_INDEX", "bbq")
+ES_VERIFY_TLS = os.environ.get("ES_VERIFY_TLS", "true").lower() == "true"
+TEMP_UNITS = os.environ.get("TEMP_UNITS", "f").lower()
+BULK_INTERVAL = int(os.environ.get("BULK_INTERVAL", "5"))
+DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
+MAX_RECONNECT_ATTEMPTS = int(os.environ.get("MAX_RECONNECT_ATTEMPTS", "10"))
+RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY", "5"))
 
 
-hwid = find_bbq_hwaddr()
-if hwid is not None:
-    bbq = Peripheral(hwid)
-else:
-    logger("No iBBQ devices found in range.")
-    raise NameError("No devices found")
-    
-
-main_service = bbq.getServiceByUUID(MAIN_SERVICE)
-bbq.setDelegate(DataDelegate())
-
-# First we have to log in
-login_characteristic = main_service.getCharacteristics(PAIR_UUID)[0]
-login_characteristic.write(CREDENTIALS_MESSAGE) # Send the magic bytes to login
-
-# Scan the device for all the services.  You don't seem to need to do both
-# of these, but you do _have_ to do one of them.  If you don't then the notifications
-# don't work and you won't get a temperature reading.  Doing both for the sake of it.
-bbq_characteristic = bbq.getCharacteristics()
-main_descriptors = main_service.getDescriptors()
-
-# Then we have to enable real time data collection
-settings_characteristic = main_service.getCharacteristics(CMD_UUID)[0]
-settings_characteristic.write(REALTIME_DATA_ENABLE, withResponse=True)
-
-# The device logs all temperature in degrees c, but we can fix that for you.  Here we change the display units, and in the DataDelegate function we convert the temps
-if temperature_units == "f":
-    settings_characteristic.write(UNITS_FAHRENHEIT, withResponse=True)
-else:
-    settings_characteristic.write(UNITS_CELSIUS, withResponse=True)
-
-# And we have to switch on notifications for the realtime characteristic.
-# UUID 2902 is the standard descriptor UUID for CCCD which we need to write to in order
-# to have data sent to us.  You can switch the services on and off with 0100 and 0000.
-# The CCCD descriptor is on the REALTIMEDATA_UUID - which means it controls the data for the probes.
-realtime_characteristic = main_service.getCharacteristics(REALTIMEDATA_UUID)[0] # This is where the temperature data lives.
-temperature_cccd = realtime_characteristic.getDescriptors(forUUID=CCCD_UUID)[0] # This wasn't in the docs, but was in the source. It still took me all day to work it out.
-# Now all we need to do is write a 1 (little endian) to it, and it will start sending data!  Easy when you know how.
-temperature_cccd.write(ON)
-
-# Let's see if we can get the battery level out of this thing as well.
-# This is supposed to be read on 0xFFF1 SETTINGS_RESULTS.
-settings_characteristic.write(BATTERY_LEVEL, withResponse=True)
-# Then we need to do the same as before and get the CCCD descriptor and switch on notifications.
-# Battery notifications are sent about every 5 mins
-settingsresult_characteristic = main_service.getCharacteristics(SETTINGS_RESULTS)[0]
-settingsresults_cccd = settingsresult_characteristic.getDescriptors(forUUID=CCCD_UUID)[0]
-settingsresults_cccd.write(ON)
+def log(msg):
+    print(msg, flush=True)
 
 
-try:
-    while True:
-        if bbq.waitForNotifications(1):
+def debug(msg):
+    if DEBUG:
+        log(f"[DEBUG] {msg}")
+
+
+bulk_buffer = []
+
+
+def handle_realtime_data(sender, data: bytearray):
+    temps = [int.from_bytes(data[i:i + 2], "little") for i in range(0, len(data), 2)]
+    debug(f"Raw temp data: {temps}")
+    now = int(datetime.now(timezone.utc).timestamp())
+
+    for idx, raw in enumerate(temps):
+        if raw == 0 or raw >= 65526:
             continue
-except KeyboardInterrupt:
-    logger("Caught ctrl-c.  Disconnecting from device.")
-    bbq.disconnect()
-except BTLEDisconnectError:
-    logger("Device has gone away..")
+        temp_c = raw / 10.0
+        if TEMP_UNITS == "f":
+            temp = round(temp_c * 1.8 + 32, 1)
+        elif TEMP_UNITS == "k":
+            temp = round(temp_c + 273.15, 1)
+        else:
+            temp = round(temp_c, 1)
+
+        doc = {"bbq_temp": temp, "bbq_probe": idx + 1, "date": now}
+        bulk_buffer.append(doc)
+        log(f"  Probe {idx + 1}: {temp} {TEMP_UNITS.upper()}")
+
+
+def handle_settings(sender, data: bytearray):
+    if len(data) < 6:
+        debug(f"Settings data too short: {data.hex()}")
+        return
+    header = data[0]
+    if header == 0x24:
+        current_voltage = int.from_bytes(data[1:3], "little")
+        max_voltage = int.from_bytes(data[3:5], "little")
+        if max_voltage == 0:
+            max_voltage = 6550
+        pct = min(100.0, round(100.0 * current_voltage / max_voltage, 1))
+        now = int(datetime.now(timezone.utc).timestamp())
+        doc = {"bbq_battery": pct, "date": now}
+        bulk_buffer.append(doc)
+        log(f"  Battery: {pct}%")
+    else:
+        debug(f"Settings header 0x{header:02x}, data: {data.hex()}")
+
+
+def flush_bulk():
+    if not bulk_buffer:
+        return
+    if not ES_PASSWORD:
+        debug("No ES_PASSWORD set, skipping ES upload")
+        bulk_buffer.clear()
+        return
+
+    target = f"{ES_URL}/{ES_INDEX}/_bulk"
+    auth = (ES_USER, ES_PASSWORD)
+    headers = {"Content-Type": "application/x-ndjson"}
+
+    body_lines = []
+    for doc in bulk_buffer:
+        body_lines.append(json.dumps({"index": {}}))
+        body_lines.append(json.dumps(doc))
+    body = "\n".join(body_lines) + "\n"
+
+    try:
+        resp = requests.post(
+            target, auth=auth, headers=headers, data=body, verify=ES_VERIFY_TLS
+        )
+        if resp.status_code not in (200, 201):
+            log(f"ES bulk error ({resp.status_code}): {resp.text[:200]}")
+        else:
+            result = resp.json()
+            if result.get("errors"):
+                for item in result["items"]:
+                    err = item.get("index", {}).get("error")
+                    if err:
+                        log(f"ES doc error: {err}")
+            else:
+                debug(f"Flushed {len(bulk_buffer)} docs to ES")
+    except requests.RequestException as e:
+        log(f"ES connection error: {e}")
+
+    bulk_buffer.clear()
+
+
+async def find_ibbq(scan_seconds=10):
+    log(f"Scanning for iBBQ devices ({scan_seconds}s)...")
+    target = None
+    best_rssi = -999
+
+    def detection_callback(device, adv_data):
+        nonlocal target, best_rssi
+        svc_uuids = adv_data.service_uuids or []
+        name = device.name or adv_data.local_name or ""
+        if IBBQ_SERVICE_UUID in svc_uuids or "ibbq" in name.lower():
+            if adv_data.rssi > best_rssi:
+                target = device
+                best_rssi = adv_data.rssi
+                debug(f"Found: {name} [{device.address}] RSSI={adv_data.rssi}")
+
+    scanner = BleakScanner(detection_callback=detection_callback)
+    await scanner.start()
+    await asyncio.sleep(scan_seconds)
+    await scanner.stop()
+
+    if target:
+        log(f"Using iBBQ at {target.address} (RSSI {best_rssi})")
+    return target
+
+
+async def run_session(device):
+    async with BleakClient(device.address) as client:
+        log("Connected to iBBQ")
+
+        await client.write_gatt_char(PAIR_UUID, CREDENTIALS_MESSAGE)
+        debug("Authenticated")
+
+        await client.write_gatt_char(CMD_UUID, REALTIME_DATA_ENABLE, response=True)
+        if TEMP_UNITS == "f":
+            await client.write_gatt_char(CMD_UUID, UNITS_FAHRENHEIT, response=True)
+        else:
+            await client.write_gatt_char(CMD_UUID, UNITS_CELSIUS, response=True)
+        await client.write_gatt_char(CMD_UUID, BATTERY_LEVEL, response=True)
+
+        await client.start_notify(REALTIMEDATA_UUID, handle_realtime_data)
+        await client.start_notify(SETTINGS_RESULTS_UUID, handle_settings)
+
+        log(f"Listening (units={TEMP_UNITS.upper()}, bulk every {BULK_INTERVAL}s)...\n")
+
+        last_flush = time.monotonic()
+        while client.is_connected:
+            await asyncio.sleep(1)
+            if time.monotonic() - last_flush >= BULK_INTERVAL:
+                flush_bulk()
+                last_flush = time.monotonic()
+
+    flush_bulk()
+
+
+async def main():
+    if not ES_PASSWORD:
+        log("WARNING: ES_PASSWORD not set — readings will print but not ship to ES")
+
+    attempt = 0
+    while attempt < MAX_RECONNECT_ATTEMPTS:
+        device = await find_ibbq()
+        if device is None:
+            attempt += 1
+            log(f"No iBBQ found (attempt {attempt}/{MAX_RECONNECT_ATTEMPTS})")
+            await asyncio.sleep(RECONNECT_DELAY)
+            continue
+
+        try:
+            attempt = 0
+            await run_session(device)
+            log("Device disconnected.")
+        except Exception as e:
+            log(f"Connection error: {e}")
+
+        attempt += 1
+        if attempt < MAX_RECONNECT_ATTEMPTS:
+            log(f"Reconnecting in {RECONNECT_DELAY}s (attempt {attempt}/{MAX_RECONNECT_ATTEMPTS})...")
+            await asyncio.sleep(RECONNECT_DELAY)
+
+    log("Max reconnect attempts reached, exiting.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log("\nShutting down.")
+        flush_bulk()
