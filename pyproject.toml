@@ -1,0 +1,15 @@
+[project]
+name = "bbq-inkbird"
+version = "0.2.0"
+description = "Inkbird iBBQ Bluetooth thermometer to Elasticsearch"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "bleak>=0.21",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+]
