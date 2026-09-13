@@ -75,9 +75,11 @@ The script will:
 - Scan for nearby iBBQ devices over Bluetooth
 - Connect and authenticate
 - Stream temperature readings to stdout
-- Auto-create an Elasticsearch [data stream](https://www.elastic.co/guide/en/elasticsearch/reference/current/data-streams.html) index template
-- Batch documents and flush to ES via the `_bulk` API
+- Auto-create an Elasticsearch data stream index template and/or a ClickHouse table
+- Batch documents and flush to configured outputs via bulk APIs
 - Automatically reconnect if the Bluetooth connection drops
+
+You can ship to Elasticsearch, ClickHouse, or both simultaneously.
 
 ### Docker
 
@@ -98,13 +100,21 @@ All configuration is via environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
+| **Elasticsearch** | | |
 | `ES_URL` | `https://localhost:9200` | Elasticsearch endpoint |
 | `ES_USER` | `elastic` | Elasticsearch username |
-| `ES_PASSWORD` | (none) | Elasticsearch password (required for shipping data) |
+| `ES_PASSWORD` | (none) | Elasticsearch password (set to enable ES output) |
 | `ES_INDEX` | `bbq` | Data stream name |
 | `ES_VERIFY_TLS` | `true` | Verify TLS certificates (`false` for self-signed) |
+| **ClickHouse** | | |
+| `CH_URL` | (none) | ClickHouse HTTP endpoint, e.g. `http://localhost:8123` (set to enable) |
+| `CH_USER` | `default` | ClickHouse username |
+| `CH_PASSWORD` | (none) | ClickHouse password |
+| `CH_DATABASE` | `bbq` | ClickHouse database name (auto-created) |
+| `CH_TABLE` | `readings` | ClickHouse table name (auto-created) |
+| **General** | | |
 | `TEMP_UNITS` | `f` | Temperature units: `f`, `c`, or `k` |
-| `BULK_INTERVAL` | `5` | Seconds between bulk flushes to ES |
+| `BULK_INTERVAL` | `5` | Seconds between bulk flushes |
 | `MAX_RECONNECT_ATTEMPTS` | `10` | BLE reconnect attempts before exiting |
 | `RECONNECT_DELAY` | `5` | Seconds between reconnect attempts |
 | `DEBUG` | `false` | Enable verbose logging |

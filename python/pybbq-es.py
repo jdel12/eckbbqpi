@@ -26,6 +26,11 @@ ES_USER = os.environ.get("ES_USER", "elastic")
 ES_PASSWORD = os.environ.get("ES_PASSWORD", "")
 ES_INDEX = os.environ.get("ES_INDEX", "bbq")
 ES_VERIFY_TLS = os.environ.get("ES_VERIFY_TLS", "true").lower() == "true"
+CH_URL = os.environ.get("CH_URL", "")
+CH_USER = os.environ.get("CH_USER", "default")
+CH_PASSWORD = os.environ.get("CH_PASSWORD", "")
+CH_DATABASE = os.environ.get("CH_DATABASE", "bbq")
+CH_TABLE = os.environ.get("CH_TABLE", "readings")
 TEMP_UNITS = os.environ.get("TEMP_UNITS", "f").lower()
 BULK_INTERVAL = int(os.environ.get("BULK_INTERVAL", "5"))
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
@@ -98,6 +103,76 @@ def ensure_index_template():
         log(f"ES connection error creating template: {e}")
 
 
+def ch_query(sql):
+    try:
+        resp = requests.post(
+            CH_URL,
+            params={"user": CH_USER, "password": CH_PASSWORD},
+            data=sql,
+        )
+        if resp.status_code != 200:
+            log(f"ClickHouse error ({resp.status_code}): {resp.text[:200]}")
+            return False
+        return True
+    except requests.RequestException as e:
+        log(f"ClickHouse connection error: {e}")
+        return False
+
+
+def ensure_ch_table():
+    if not CH_URL:
+        return
+    if not ch_query(f"CREATE DATABASE IF NOT EXISTS {CH_DATABASE}"):
+        return
+    create_sql = (
+        f"CREATE TABLE IF NOT EXISTS {CH_DATABASE}.{CH_TABLE} ("
+        "  timestamp DateTime64(3, 'UTC'),"
+        "  bbq_temp Nullable(Float32),"
+        "  bbq_probe Nullable(UInt8),"
+        "  bbq_battery Nullable(Float32),"
+        "  session_id String"
+        ") ENGINE = MergeTree()"
+        " ORDER BY (session_id, timestamp)"
+    )
+    if ch_query(create_sql):
+        log(f"ClickHouse table {CH_DATABASE}.{CH_TABLE} ready")
+
+
+def flush_ch():
+    if not bulk_buffer or not CH_URL:
+        return
+
+    ch_rows = []
+    for doc in bulk_buffer:
+        row = {
+            "timestamp": doc["@timestamp"],
+            "bbq_temp": doc.get("bbq_temp"),
+            "bbq_probe": doc.get("bbq_probe"),
+            "bbq_battery": doc.get("bbq_battery"),
+            "session_id": doc.get("session_id", SESSION_ID),
+        }
+        ch_rows.append(json.dumps(row))
+
+    body = "\n".join(ch_rows) + "\n"
+    try:
+        resp = requests.post(
+            CH_URL,
+            params={
+                "user": CH_USER,
+                "password": CH_PASSWORD,
+                "query": f"INSERT INTO {CH_DATABASE}.{CH_TABLE} FORMAT JSONEachRow",
+            },
+            data=body,
+            headers={"Content-Type": "application/x-ndjson"},
+        )
+        if resp.status_code != 200:
+            log(f"ClickHouse insert error ({resp.status_code}): {resp.text[:200]}")
+        else:
+            debug(f"Flushed {len(ch_rows)} docs to ClickHouse")
+    except requests.RequestException as e:
+        log(f"ClickHouse connection error: {e}")
+
+
 def handle_realtime_data(sender, data: bytearray):
     temps = [int.from_bytes(data[i:i + 2], "little") for i in range(0, len(data), 2)]
     debug(f"Raw temp data: {temps}")
@@ -138,12 +213,8 @@ def handle_settings(sender, data: bytearray):
         debug(f"Settings header 0x{header:02x}, data: {data.hex()}")
 
 
-def flush_bulk():
-    if not bulk_buffer:
-        return
+def flush_es():
     if not ES_PASSWORD:
-        debug("No ES_PASSWORD set, skipping ES upload")
-        bulk_buffer.clear()
         return
 
     target = f"{ES_URL}/{ES_INDEX}/_bulk"
@@ -174,6 +245,17 @@ def flush_bulk():
     except requests.RequestException as e:
         log(f"ES connection error: {e}")
 
+
+def flush_bulk():
+    if not bulk_buffer:
+        return
+    if not ES_PASSWORD and not CH_URL:
+        debug("No outputs configured, skipping upload")
+        bulk_buffer.clear()
+        return
+
+    flush_es()
+    flush_ch()
     bulk_buffer.clear()
 
 
@@ -233,10 +315,17 @@ async def run_session(device):
 
 async def main():
     log(f"Session: {SESSION_ID}")
-    if not ES_PASSWORD:
-        log("WARNING: ES_PASSWORD not set — readings will print but not ship to ES")
-    else:
+    outputs = []
+    if ES_PASSWORD:
         ensure_index_template()
+        outputs.append("Elasticsearch")
+    if CH_URL:
+        ensure_ch_table()
+        outputs.append("ClickHouse")
+    if not outputs:
+        log("WARNING: No outputs configured — readings will print only")
+    else:
+        log(f"Outputs: {', '.join(outputs)}")
 
     attempt = 0
     while attempt < MAX_RECONNECT_ATTEMPTS:
