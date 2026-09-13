@@ -1,8 +1,7 @@
 import asyncio
 import json
 import os
-import struct
-import sys
+import re
 import time
 from datetime import datetime, timezone
 
@@ -88,7 +87,7 @@ def ensure_index_template():
         log(f"ES connection error checking template: {e}")
         return
 
-    template = INDEX_TEMPLATE.copy()
+    template = json.loads(json.dumps(INDEX_TEMPLATE))
     template["index_patterns"] = [f"{ES_INDEX}*"]
 
     try:
@@ -101,6 +100,11 @@ def ensure_index_template():
             log(f"Failed to create index template ({resp.status_code}): {resp.text[:200]}")
     except requests.RequestException as e:
         log(f"ES connection error creating template: {e}")
+
+
+def _validate_identifier(name, label):
+    if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+        raise ValueError(f"Invalid {label}: '{name}' — must be alphanumeric/underscore only")
 
 
 def ch_query(sql):
@@ -122,6 +126,8 @@ def ch_query(sql):
 def ensure_ch_table():
     if not CH_URL:
         return
+    _validate_identifier(CH_DATABASE, "CH_DATABASE")
+    _validate_identifier(CH_TABLE, "CH_TABLE")
     if not ch_query(f"CREATE DATABASE IF NOT EXISTS {CH_DATABASE}"):
         return
     create_sql = (
