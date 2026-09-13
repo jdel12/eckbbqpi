@@ -1,158 +1,148 @@
-# ECK, BBQ and Pi
+# BBQ Inkbird
 
-## Intro
-
-A demo architecture with a real-world function: capture Bluetooth temperature data from an Inkbird iBBQ thermometer and ship it to Elasticsearch for visualization in Kibana.
+Capture Bluetooth temperature data from an Inkbird iBBQ thermometer and store it in Elasticsearch, ClickHouse, or both.
 
 ```mermaid
 flowchart LR
-  Inkbird("Inkbird iBBQ Thermometer") --> |Bluetooth|Host
+  Inkbird("Inkbird iBBQ") --> |Bluetooth|Host
 
-  subgraph Host[Mac / Raspberry Pi / Container]
-    Python[Python + Bleak]
+  subgraph Host[Mac / Pi / Container]
+    Python[pybbq.py]
   end
-  
-Host --> |"_bulk API"|ElasticStack
 
-  subgraph ElasticStack[Elastic Stack on ECK]
-    ES1[Elasticsearch-1]
-    ES2[Elasticsearch-2]
-    ES3[Elasticsearch-3]
-    Kibana[Kibana]
-    Fleet[Fleet Server]
-  end
+  Host --> |"_bulk API"|ES[Elasticsearch]
+  Host --> |"HTTP JSON"|CH[ClickHouse]
 ```
+
+Works on macOS and Linux (including Raspberry Pi). Outputs are opt-in — set `ES_PASSWORD` for Elasticsearch, `CH_URL` for ClickHouse, or both. With neither set, readings print to stdout only.
 
 ## Quick Start
 
-### 1. Set up the Elastic cluster
+### Option A: One-off cook with local ClickHouse (easiest)
 
-You need the [ECK operator](https://www.elastic.co/guide/en/cloud-on-k8s/current/k8s-deploy-eck.html) installed, then apply the manifests:
-
-```bash
-kubectl apply -f elasticstack/elasticsearch.yaml
-kubectl apply -f elasticstack/kibana.yaml
-kubectl apply -f elasticstack/fleet.yaml
-```
-
-This gives you a 3-node Elasticsearch cluster, Kibana, and Fleet Server, all running Elastic 9.5.
-
-### 2. Set up Python
-
-Works on macOS, Linux (including Raspberry Pi 3/4/5), or in a container.
+No cluster needed. Spin up a local ClickHouse container and run the script:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install bleak requests
+# Start ClickHouse
+docker compose up clickhouse -d
+
+# Set up Python and run
+python3 -m venv .venv && source .venv/bin/activate && pip install bleak requests
+CH_URL=http://localhost:8123 python python/pybbq.py
 ```
 
-### 3. Configure
+That's it. The script auto-creates the database and table, connects to your Inkbird, and starts recording. Query your cook afterward:
 
-Copy the example env file and fill in your cluster details:
+```bash
+docker exec -it bbq-inkbird-clickhouse-1 clickhouse-client \
+  --query "SELECT * FROM bbq.readings ORDER BY timestamp"
+```
+
+### Option B: Ship to Elasticsearch
+
+Point at any Elasticsearch cluster (self-managed, ECK, or Elastic Cloud):
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate && pip install bleak requests
+ES_URL=https://your-cluster:9200 ES_PASSWORD=changeme python python/pybbq.py
+```
+
+The script auto-creates a [data stream](https://www.elastic.co/guide/en/elasticsearch/reference/current/data-streams.html) index template with proper field mappings on first run.
+
+For a self-managed ECK cluster, see [ECK Setup](#eck-cluster) below.
+
+### Option C: Both at once
+
+```bash
+ES_URL=https://your-cluster:9200 ES_PASSWORD=changeme \
+CH_URL=http://localhost:8123 \
+python python/pybbq.py
+```
+
+### Using a .env file
+
+For repeated use, copy the example and uncomment what you need:
 
 ```bash
 cp .env.example .env
-# Edit .env with your ES_URL, ES_PASSWORD, etc.
+# Uncomment and fill in the outputs you want
+source .env && python python/pybbq.py
 ```
 
-### 4. Run
+### Docker (Linux / Raspberry Pi)
+
+On a Linux host with Bluetooth, the `bbq` service handles everything:
 
 ```bash
-source .env && python python/pybbq-es.py
-```
+# ClickHouse + bbq script together
+docker compose --profile linux up
 
-Or export the variables individually:
-
-```bash
-export ES_URL=https://your-cluster:9200
-export ES_PASSWORD=your-password
-export ES_INDEX=bbq
-python python/pybbq-es.py
-```
-
-The script will:
-- Scan for nearby iBBQ devices over Bluetooth
-- Connect and authenticate
-- Stream temperature readings to stdout
-- Auto-create an Elasticsearch data stream index template and/or a ClickHouse table
-- Batch documents and flush to configured outputs via bulk APIs
-- Automatically reconnect if the Bluetooth connection drops
-
-You can ship to Elasticsearch, ClickHouse, or both simultaneously.
-
-### Docker
-
-For Raspberry Pi or any Linux host with Bluetooth:
-
-```bash
+# Or build and run standalone
 docker build -t bbq-inkbird .
-docker run --rm --net=host --privileged \
-  --env-file .env \
-  bbq-inkbird
+docker run --rm --net=host --privileged --env-file .env bbq-inkbird
 ```
 
-`--net=host --privileged` is required for Bluetooth/D-Bus access.
+`--net=host --privileged` is required for Bluetooth/D-Bus access. On macOS, run the Python script natively (CoreBluetooth doesn't work inside Docker).
 
 ## Configuration
 
-All configuration is via environment variables:
+All configuration is via environment variables. Everything has sensible defaults — you only need to set the output(s) you want.
 
 | Variable | Default | Description |
 |---|---|---|
-| **Elasticsearch** | | |
+| **Elasticsearch** | | *Set `ES_PASSWORD` to enable* |
 | `ES_URL` | `https://localhost:9200` | Elasticsearch endpoint |
-| `ES_USER` | `elastic` | Elasticsearch username |
-| `ES_PASSWORD` | (none) | Elasticsearch password (set to enable ES output) |
+| `ES_USER` | `elastic` | Username |
+| `ES_PASSWORD` | *(none)* | Password |
 | `ES_INDEX` | `bbq` | Data stream name |
-| `ES_VERIFY_TLS` | `true` | Verify TLS certificates (`false` for self-signed) |
-| **ClickHouse** | | |
-| `CH_URL` | (none) | ClickHouse HTTP endpoint, e.g. `http://localhost:8123` (set to enable) |
-| `CH_USER` | `default` | ClickHouse username |
-| `CH_PASSWORD` | (none) | ClickHouse password |
-| `CH_DATABASE` | `bbq` | ClickHouse database name (auto-created) |
-| `CH_TABLE` | `readings` | ClickHouse table name (auto-created) |
+| `ES_VERIFY_TLS` | `true` | Set `false` for self-signed certs |
+| **ClickHouse** | | *Set `CH_URL` to enable* |
+| `CH_URL` | *(none)* | HTTP endpoint, e.g. `http://localhost:8123` |
+| `CH_USER` | `default` | Username |
+| `CH_PASSWORD` | *(none)* | Password |
+| `CH_DATABASE` | `bbq` | Database name (auto-created) |
+| `CH_TABLE` | `readings` | Table name (auto-created) |
 | **General** | | |
-| `TEMP_UNITS` | `f` | Temperature units: `f`, `c`, or `k` |
-| `BULK_INTERVAL` | `5` | Seconds between bulk flushes |
-| `MAX_RECONNECT_ATTEMPTS` | `10` | BLE reconnect attempts before exiting |
+| `TEMP_UNITS` | `f` | `f` (Fahrenheit), `c` (Celsius), or `k` (Kelvin) |
+| `BULK_INTERVAL` | `5` | Seconds between flushes to outputs |
+| `MAX_RECONNECT_ATTEMPTS` | `10` | BLE reconnect attempts before exit |
 | `RECONNECT_DELAY` | `5` | Seconds between reconnect attempts |
-| `DEBUG` | `false` | Enable verbose logging |
+| `DEBUG` | `false` | Verbose logging |
 
 ## Data Model
 
-Documents are written to an Elasticsearch [data stream](https://www.elastic.co/guide/en/elasticsearch/reference/current/data-streams.html). The index template is created automatically on first run.
+Each cook session gets a unique `session_id` (UTC timestamp when the script starts, e.g. `20260913T184523Z`) for grouping readings in queries and dashboards.
 
-Each cook session gets a unique `session_id` (UTC timestamp of script start) for easy filtering in Kibana.
-
-### Temperature document
-
+**Temperature reading:**
 ```json
-{"@timestamp": "2026-09-13T18:45:23.123456+00:00", "bbq_temp": 225.3, "bbq_probe": 1, "session_id": "20260913T184523Z"}
+{"@timestamp": "2026-09-13T18:45:23+00:00", "bbq_temp": 225.3, "bbq_probe": 1, "session_id": "20260913T184523Z"}
 ```
 
-### Battery document
-
+**Battery reading:**
 ```json
-{"@timestamp": "2026-09-13T18:45:23.123456+00:00", "bbq_battery": 85.2, "session_id": "20260913T184523Z"}
+{"@timestamp": "2026-09-13T18:45:23+00:00", "bbq_battery": 85.2, "session_id": "20260913T184523Z"}
 ```
+
+In Elasticsearch, documents go into a data stream. In ClickHouse, they go into a `MergeTree` table ordered by `(session_id, timestamp)`.
 
 ## ECK Cluster
 
-The `elasticstack/` directory contains Kubernetes manifests for Elastic 9.5:
+The `elasticstack/` directory contains Kubernetes manifests for Elastic 9.5 managed by [ECK](https://www.elastic.co/guide/en/cloud-on-k8s/current/k8s-deploy-eck.html):
 
-- **`elasticsearch.yaml`** — 3-node cluster with self-monitoring
-- **`kibana.yaml`** — Kibana with pre-configured Fleet agent policies
-- **`fleet.yaml`** — Fleet Server, Elastic Agent DaemonSet, RBAC
+```bash
+kubectl apply -f elasticstack/elasticsearch.yaml   # 3-node cluster
+kubectl apply -f elasticstack/kibana.yaml           # Kibana + Fleet policies
+kubectl apply -f elasticstack/fleet.yaml            # Fleet Server + Agent DaemonSet
+```
 
-These manifests come from the [Kittyhawk](https://github.com/jdel12/eck-kittyhawk/) repo. Adjust resource limits, storage classes, and replica counts to fit your environment.
+These manifests come from [Kittyhawk](https://github.com/jdel12/eck-kittyhawk/). Adjust resource limits, storage, and replica counts for your environment.
 
-## Inkbird IBT-4XS
+## Inkbird Compatibility
 
-The thermometer should work out of the box — just power it on. Any Bluetooth-enabled Inkbird using the iBBQ protocol should be compatible. The script scans for devices advertising the iBBQ service UUID (`FFF0`) and picks the one with the strongest signal.
+Power on the thermometer — no pairing needed. The script scans for any device advertising the iBBQ service UUID (`FFF0`) and picks the strongest signal. Make sure no phone app is connected (BLE allows one connection at a time).
 
-Make sure no phone app is connected to the device, as BLE only allows one active connection.
+Tested with the IBT-4XS. Any Inkbird using the iBBQ BLE protocol should work.
 
 ## Acknowledgements
 
-The iBBQ Bluetooth protocol implementation is heavily inspired by [pybq](https://github.com/8none1/pybq) by [8none1](https://github.com/8none1).
+iBBQ Bluetooth protocol implementation inspired by [pybq](https://github.com/8none1/pybq) by [8none1](https://github.com/8none1).

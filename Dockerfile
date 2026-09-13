@@ -14,4 +14,4 @@ RUN pip install --no-cache-dir bleak requests
 
 COPY python/ python/
 
-CMD ["python", "python/pybbq-es.py"]
+CMD ["python", "python/pybbq.py"]
