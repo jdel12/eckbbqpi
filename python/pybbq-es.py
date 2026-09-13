@@ -32,6 +32,28 @@ DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 MAX_RECONNECT_ATTEMPTS = int(os.environ.get("MAX_RECONNECT_ATTEMPTS", "10"))
 RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY", "5"))
 
+SESSION_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+INDEX_TEMPLATE = {
+    "index_patterns": [],
+    "data_stream": {},
+    "priority": 200,
+    "template": {
+        "settings": {
+            "number_of_replicas": 1
+        },
+        "mappings": {
+            "properties": {
+                "@timestamp": {"type": "date"},
+                "bbq_temp": {"type": "float"},
+                "bbq_probe": {"type": "integer"},
+                "bbq_battery": {"type": "float"},
+                "session_id": {"type": "keyword"},
+            }
+        }
+    }
+}
+
 
 def log(msg):
     print(msg, flush=True)
@@ -45,10 +67,41 @@ def debug(msg):
 bulk_buffer = []
 
 
+def ensure_index_template():
+    if not ES_PASSWORD:
+        return
+    template_name = f"{ES_INDEX}-template"
+    url = f"{ES_URL}/_index_template/{template_name}"
+    auth = (ES_USER, ES_PASSWORD)
+
+    try:
+        resp = requests.get(url, auth=auth, verify=ES_VERIFY_TLS)
+        if resp.status_code == 200:
+            debug(f"Index template '{template_name}' already exists")
+            return
+    except requests.RequestException as e:
+        log(f"ES connection error checking template: {e}")
+        return
+
+    template = INDEX_TEMPLATE.copy()
+    template["index_patterns"] = [f"{ES_INDEX}*"]
+
+    try:
+        resp = requests.put(
+            url, auth=auth, json=template, verify=ES_VERIFY_TLS
+        )
+        if resp.status_code == 200:
+            log(f"Created index template '{template_name}' with data stream")
+        else:
+            log(f"Failed to create index template ({resp.status_code}): {resp.text[:200]}")
+    except requests.RequestException as e:
+        log(f"ES connection error creating template: {e}")
+
+
 def handle_realtime_data(sender, data: bytearray):
     temps = [int.from_bytes(data[i:i + 2], "little") for i in range(0, len(data), 2)]
     debug(f"Raw temp data: {temps}")
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = datetime.now(timezone.utc).isoformat()
 
     for idx, raw in enumerate(temps):
         if raw == 0 or raw >= 65526:
@@ -61,7 +114,7 @@ def handle_realtime_data(sender, data: bytearray):
         else:
             temp = round(temp_c, 1)
 
-        doc = {"bbq_temp": temp, "bbq_probe": idx + 1, "date": now}
+        doc = {"@timestamp": now, "bbq_temp": temp, "bbq_probe": idx + 1, "session_id": SESSION_ID}
         bulk_buffer.append(doc)
         log(f"  Probe {idx + 1}: {temp} {TEMP_UNITS.upper()}")
 
@@ -77,8 +130,8 @@ def handle_settings(sender, data: bytearray):
         if max_voltage == 0:
             max_voltage = 6550
         pct = min(100.0, round(100.0 * current_voltage / max_voltage, 1))
-        now = int(datetime.now(timezone.utc).timestamp())
-        doc = {"bbq_battery": pct, "date": now}
+        now = datetime.now(timezone.utc).isoformat()
+        doc = {"@timestamp": now, "bbq_battery": pct, "session_id": SESSION_ID}
         bulk_buffer.append(doc)
         log(f"  Battery: {pct}%")
     else:
@@ -99,7 +152,7 @@ def flush_bulk():
 
     body_lines = []
     for doc in bulk_buffer:
-        body_lines.append(json.dumps({"index": {}}))
+        body_lines.append(json.dumps({"create": {}}))
         body_lines.append(json.dumps(doc))
     body = "\n".join(body_lines) + "\n"
 
@@ -113,7 +166,7 @@ def flush_bulk():
             result = resp.json()
             if result.get("errors"):
                 for item in result["items"]:
-                    err = item.get("index", {}).get("error")
+                    err = item.get("create", {}).get("error")
                     if err:
                         log(f"ES doc error: {err}")
             else:
@@ -179,8 +232,11 @@ async def run_session(device):
 
 
 async def main():
+    log(f"Session: {SESSION_ID}")
     if not ES_PASSWORD:
         log("WARNING: ES_PASSWORD not set — readings will print but not ship to ES")
+    else:
+        ensure_index_template()
 
     attempt = 0
     while attempt < MAX_RECONNECT_ATTEMPTS:
